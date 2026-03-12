@@ -1,0 +1,27 @@
+// Simple plasma/gradient shader — default fallback
+// License: CC0
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    float t = iTime * 0.5;
+
+    float v = 0.0;
+    v += sin(uv.x * 10.0 + t);
+    v += sin((uv.y * 10.0 + t) * 0.5);
+    v += sin((uv.x * 10.0 + uv.y * 10.0 + t) * 0.3);
+    v += sin(length(uv * 10.0 - 5.0) + t);
+
+    v *= 0.25;
+
+    vec3 col = vec3(
+        sin(v * 3.14159 + 0.0) * 0.5 + 0.5,
+        sin(v * 3.14159 + 2.094) * 0.5 + 0.5,
+        sin(v * 3.14159 + 4.189) * 0.5 + 0.5
+    );
+
+    // Darken edges for vignette
+    float vignette = smoothstep(0.8, 0.2, length(uv - 0.5));
+    col *= vignette;
+
+    fragColor = vec4(col, 1.0);
+}

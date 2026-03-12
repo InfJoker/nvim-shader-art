@@ -1,0 +1,19 @@
+[package]
+name = "shader-art-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "28"
+naga = { version = "26", features = ["glsl-in", "wgsl-out"] }
+png = "0.18"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"
+libc = "0.2"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = true
+strip = true
