@@ -326,12 +326,43 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
   })
   state.active_job = job_id
 
+  local sidecar_group = vim.api.nvim_create_augroup("ShaderArtSidecar", { clear = true })
+
   vim.api.nvim_create_autocmd("User", {
-    group = vim.api.nvim_create_augroup("ShaderArtSidecar", { clear = true }),
+    group = sidecar_group,
     pattern = "AlphaClosed",
     once = true,
     callback = function()
       stop_sidecar(cleanup_escapes)
+    end,
+  })
+
+  -- On BufLeave: restore cursor visibility (hidden by sidecar start) and
+  -- delete Kitty images so they don't bleed through floating windows.
+  -- Without this, the terminal cursor stays hidden/mispositioned when
+  -- navigating away from alpha before AlphaClosed fires.
+  vim.api.nvim_create_autocmd("BufLeave", {
+    group = sidecar_group,
+    callback = function()
+      if state.tty then
+        local esc = "\x1b[?25h"
+        if cleanup_escapes then
+          esc = cleanup_escapes .. esc
+        end
+        pcall(state.tty.write, state.tty, esc)
+        pcall(state.tty.flush, state.tty)
+      end
+    end,
+  })
+
+  -- On BufEnter back to alpha: re-hide cursor so the sidecar can render cleanly.
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = sidecar_group,
+    callback = function()
+      if vim.bo.filetype == "alpha" and state.tty then
+        pcall(state.tty.write, state.tty, "\x1b[?25l")
+        pcall(state.tty.flush, state.tty)
+      end
     end,
   })
 end
