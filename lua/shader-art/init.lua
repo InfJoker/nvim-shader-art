@@ -343,6 +343,11 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
       cell_px_height = nil
 
       if state.auto_sized then
+        -- Allow alpha's own VimResized redraw to succeed
+        local win = find_alpha_win()
+        if win then
+          pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = vim.api.nvim_win_get_buf(win) })
+        end
         -- Debounce: cancel any pending restart, then schedule a new one.
         -- Dimensions are computed in the deferred callback so vim.o.lines/columns
         -- have settled after multi-step resize events.
