@@ -39,6 +39,10 @@ local state = {
   shader_index = 1,
   --- Whether dimensions were auto-computed (not explicitly set by user).
   auto_sized = false,
+  --- Reference to the alpha padding element for dynamic height updates.
+  element = nil,
+  --- Pending resize debounce timer, or nil.
+  _resize_timer = nil,
 }
 
 --- Compute adaptive shader dimensions based on terminal size.
@@ -343,11 +347,6 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
       cell_px_height = nil
 
       if state.auto_sized then
-        -- Allow alpha's own VimResized redraw to succeed
-        local win = find_alpha_win()
-        if win then
-          pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = vim.api.nvim_win_get_buf(win) })
-        end
         -- Debounce: cancel any pending restart, then schedule a new one.
         -- Dimensions are computed in the deferred callback so vim.o.lines/columns
         -- have settled after multi-step resize events.
@@ -360,20 +359,22 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
           state._resize_timer = nil
           local ok, err = pcall(function()
             local new_w, new_h = compute_dimensions()
-            if new_w ~= state.el_width or new_h ~= state.el_height then
+            local dims_changed = new_w ~= state.el_width or new_h ~= state.el_height
+            if dims_changed then
               state.el_width = new_w
               state.el_height = new_h
               if state.element then
                 state.element.val = new_h
               end
-              -- Re-layout alpha with updated padding
-              local win = find_alpha_win()
-              if win then
-                local buf = vim.api.nvim_win_get_buf(win)
-                vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
-                pcall(require("alpha").redraw)
-                vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
-              end
+            end
+            -- Re-layout alpha (dims may have changed, or window just needs redraw).
+            -- Alpha's buffer is non-modifiable; temporarily unlock for redraw.
+            local win = find_alpha_win()
+            if win then
+              local buf = vim.api.nvim_win_get_buf(win)
+              vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+              pcall(require("alpha").redraw)
+              vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
             end
             if state.mode ~= "kitty" then
               vim.cmd("mode")
