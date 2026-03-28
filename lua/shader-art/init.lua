@@ -37,7 +37,20 @@ local state = {
   row_offset = 3,
   --- Shader cycling index.
   shader_index = 1,
+  --- Whether dimensions were auto-computed (not explicitly set by user).
+  auto_sized = false,
 }
+
+--- Compute adaptive shader dimensions based on terminal size.
+--- @return number width in character columns
+--- @return number height in character rows
+local function compute_dimensions()
+  local max_w = 69
+  local max_h = 16
+  local w = math.min(max_w, vim.o.columns - 4)
+  local h = math.min(max_h, math.floor((vim.o.lines - 10) / 2))
+  return math.max(w, 10), math.max(h, 4)
+end
 
 --- Detect the real tty device path for Neovim's stdout.
 --- jobstart() children have no controlling terminal, so /dev/tty fails.
@@ -193,8 +206,9 @@ function M.get_command()
     mode = detect.detect()
   end
 
-  local char_width = config.config.width or 69
-  local char_height = config.config.height or 16
+  local auto_w, auto_h = compute_dimensions()
+  local char_width = config.config.width or auto_w
+  local char_height = config.config.height or auto_h
 
   local cmd = build_command(mode, char_width, char_height)
   if not cmd then
@@ -248,6 +262,10 @@ local function build_kitty_apc(control, b64)
   return table.concat(parts)
 end
 
+-- Forward declarations for mutual recursion with start_sidecar's VimResized handler.
+local start_ascii_sidecar
+local start_kitty_sidecar
+
 --- Start a sidecar process with shared setup (tty, position, autocmds, lifecycle).
 --- @param mode string "ascii"|"kitty"
 --- @param el_width number character columns
@@ -257,8 +275,8 @@ end
 local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_escapes)
   stop_sidecar(cleanup_escapes)
 
-  -- Mutable position — updated on VimResized
-  local pos = { row = 0, col = 0 }
+  -- Mutable position — updated on VimResized and (for Kitty) CursorMoved
+  local pos = { row = 0, col = 0, visible = true }
   local function recalc_position()
     local win = find_alpha_win()
     if not win then
@@ -271,6 +289,9 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
     if pos.col < 1 then
       pos.col = 1
     end
+    -- Kitty visibility is managed by the CursorMoved handler, not here.
+    -- Always reset to visible on position recalculation (e.g. after resize).
+    pos.visible = true
   end
   recalc_position()
 
@@ -290,12 +311,81 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
   tty:flush()
 
   local resize_group = vim.api.nvim_create_augroup("ShaderArtResize", { clear = true })
+  -- Kitty: delete images when buffer scrolls, restore when scrolled back
+  if mode == "kitty" then
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      group = resize_group,
+      callback = function()
+        if vim.bo.filetype ~= "alpha" then
+          return
+        end
+        local win = find_alpha_win()
+        if not win then
+          return
+        end
+        local info = vim.fn.getwininfo(win)
+        local topline = (info and info[1] and info[1].topline) or 1
+        local now_visible = topline <= 1
+        if pos.visible and not now_visible and state.tty == tty then
+          -- Buffer scrolled: delete Kitty images so they don't overlay text
+          pcall(tty.write, tty, KITTY_DELETE)
+          pcall(tty.flush, tty)
+        end
+        pos.visible = now_visible
+      end,
+    })
+  end
   vim.api.nvim_create_autocmd("VimResized", {
     group = resize_group,
     callback = function()
       -- Invalidate cell size cache (monitor/DPI may have changed)
       cell_px_width = nil
       cell_px_height = nil
+
+      if state.auto_sized then
+        -- Debounce: cancel any pending restart, then schedule a new one.
+        -- Dimensions are computed in the deferred callback so vim.o.lines/columns
+        -- have settled after multi-step resize events.
+        -- NOTE: don't stop the sidecar here — stop_sidecar deletes this augroup,
+        -- which would prevent subsequent VimResized events from being handled.
+        if state._resize_timer then
+          state._resize_timer:stop()
+        end
+        state._resize_timer = vim.defer_fn(function()
+          state._resize_timer = nil
+          local ok, err = pcall(function()
+            local new_w, new_h = compute_dimensions()
+            if new_w ~= state.el_width or new_h ~= state.el_height then
+              state.el_width = new_w
+              state.el_height = new_h
+              if state.element then
+                state.element.val = new_h
+              end
+              -- Re-layout alpha with updated padding
+              local win = find_alpha_win()
+              if win then
+                local buf = vim.api.nvim_win_get_buf(win)
+                vim.api.nvim_set_option_value("modifiable", true, { buf = buf })
+                pcall(require("alpha").redraw)
+                vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+              end
+            end
+            if state.mode ~= "kitty" then
+              vim.cmd("mode")
+            end
+            if state.mode == "kitty" then
+              start_kitty_sidecar(state.el_width, state.el_height)
+            else
+              start_ascii_sidecar(state.el_width, state.el_height)
+            end
+          end)
+          if not ok then
+            vim.notify("[shader-art] resize error: " .. tostring(err), vim.log.levels.WARN)
+          end
+        end, 100)
+        return
+      end
+
       recalc_position()
     end,
   })
@@ -368,7 +458,7 @@ local function start_sidecar(mode, el_width, el_height, on_stdout_fn, cleanup_es
 end
 
 --- Start the ASCII sidecar process.
-local function start_ascii_sidecar(el_width, el_height)
+start_ascii_sidecar = function(el_width, el_height)
   local partial = ""
   local row_buf = {}
   local total_rows = el_height
@@ -404,7 +494,7 @@ local function start_ascii_sidecar(el_width, el_height)
 end
 
 --- Start the Kitty sidecar with double-buffered graphics protocol.
-local function start_kitty_sidecar(el_width, el_height)
+start_kitty_sidecar = function(el_width, el_height)
   local front_id = 0
   local back_id = 1
   local partial = ""
@@ -422,7 +512,7 @@ local function start_kitty_sidecar(el_width, el_height)
         partial = chunk
       elseif chunk ~= "" then
         local header, b64 = chunk:match "^([^;]+);(.+)$"
-        if header and b64 and vim.bo.filetype == "alpha" and state.tty == tty then
+        if header and b64 and vim.bo.filetype == "alpha" and state.tty == tty and pos.visible then
           local w, h, cols, rows = header:match "^(%d+),(%d+),(%d+),(%d+)$"
           if w then
             local transmit_ctl = string.format("a=t,f=100,i=%d,s=%s,v=%s,q=2", back_id, w, h)
@@ -476,12 +566,14 @@ function M.make_element(opts)
     mode = "ascii"
   end
 
-  local el_width = opts.width or config.config.width or 69
-  local el_height = opts.height or config.config.height or 16
+  local auto_w, auto_h = compute_dimensions()
+  local el_width = opts.width or config.config.width or auto_w
+  local el_height = opts.height or config.config.height or auto_h
 
   state.mode = mode
   state.el_width = el_width
   state.el_height = el_height
+  state.auto_sized = not (opts.width or config.config.width) or not (opts.height or config.config.height)
   if opts.row_offset then
     state.row_offset = opts.row_offset
   end
@@ -498,6 +590,7 @@ function M.make_element(opts)
     type = "padding",
     val = el_height,
   }
+  state.element = element
 
   local start_fn = mode == "kitty" and start_kitty_sidecar or start_ascii_sidecar
 
